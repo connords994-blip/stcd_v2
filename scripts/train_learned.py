@@ -13,10 +13,10 @@ from stcd import metrics
 from stcd.datasets import led
 from stcd.events import events_to_tensor, TimeGrid
 from stcd.frontend import SpikingFrontEnd, FrontEndConfig
-from stcd.learned import DynThreshSNN, SpatialDenoiser
+from stcd.learned import DynThreshSNN, SpatialDenoiser, CombinedDenoiser
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "data", "led")
-MODEL = os.environ.get("MODEL", "b1")   # b1 = dyn-threshold SNN, b2 = spatial recombiner
+MODEL = os.environ.get("MODEL", "b1")   # b1=dyn-threshold SNN, b2=spatial recombiner, combined=B1+B2
 HEAD = os.environ.get("HEAD", "theta")
 STEPS = int(os.environ.get("STEPS", "400"))
 PS = int(os.environ.get("PS", "160"))
@@ -99,8 +99,10 @@ def evaluate(model):
     return auc, da
 
 
-model = (SpatialDenoiser() if MODEL == "b2" else DynThreshSNN(C=16, head=HEAD)).to(dev)
-tag = "b2_spatial" if MODEL == "b2" else f"b1_{HEAD}"
+_models = {"b2": lambda: SpatialDenoiser(), "combined": lambda: CombinedDenoiser(),
+           "b1": lambda: DynThreshSNN(C=16, head=HEAD)}
+model = _models.get(MODEL, _models["b1"])().to(dev)
+tag = {"b2": "b2_spatial", "combined": "combined"}.get(MODEL, f"b1_{HEAD}")
 print(f"model={MODEL} ({tag})")
 opt = torch.optim.Adam(model.parameters(), lr=LR)
 print(f"init eval: AUC/DA = {evaluate(model)}")

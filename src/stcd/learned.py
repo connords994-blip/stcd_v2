@@ -64,6 +64,42 @@ class DynThreshSNN(nn.Module):
         return self.forward(x)[:, 0]                     # [B,H,W,T]
 
 
+class CombinedDenoiser(nn.Module):
+    """B1+B2 combined ceiling (cost ignored) — the max reach of the STCD structure with
+    BOTH learned mechanisms: a B2 dilated-conv long-range **spatial-recombination** trunk,
+    then B1's **leaky temporal integration** gated by a learned per-pixel **dynamic
+    threshold** (DTB). Same I/O contract: ``[B,2,H,W,T]`` → logit ``[B,1,H,W,T]``."""
+
+    def __init__(self, C: int = 24, dilations=(1, 2, 4, 8), tau_steps: float = 2.0):
+        super().__init__()
+        self.inp = nn.Conv2d(4, C, 3, padding=1)
+        self.spatial = nn.ModuleList(
+            [nn.Conv2d(C, C, 3, padding=d, dilation=d) for d in dilations])  # B2 trunk
+        self.dtb = nn.Conv2d(C, 1, 3, padding=1)        # B1 dynamic-threshold head
+        self.edb_out = nn.Conv2d(C, 1, 3, padding=1)    # B1 readout
+        self.alpha = float(torch.exp(torch.tensor(-1.0 / tau_steps)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B,2,H,W,T]
+        ctx = x.sum(-1)
+        feats = []
+        for t in range(x.shape[-1]):
+            h = F.relu(self.inp(torch.cat([x[..., t], ctx], dim=1)))
+            for layer in self.spatial:
+                h = F.relu(layer(h) + h)
+            feats.append(h)                              # [B,C,H,W] spatial features
+        dmap = F.softplus(self.dtb(torch.stack(feats, 0).mean(0)))   # [B,1,H,W] dyn threshold
+        vo = 0.0
+        out = []
+        for h in feats:
+            vo = self.alpha * vo + self.edb_out(h)       # leaky temporal integration
+            out.append(vo - dmap)                        # gated by dynamic threshold
+        return torch.stack(out, dim=-1)
+
+    @torch.no_grad()
+    def score_cells(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)[:, 0]
+
+
 class SpatialDenoiser(nn.Module):
     """B2 oracle — a learned long-range SPATIAL recombiner (dilated conv stack),
     a pure-PyTorch stand-in for EDmamba's S-SSM. Replaces STCD's fixed k×k box-sum
