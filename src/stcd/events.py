@@ -33,6 +33,11 @@ class Events:
     H, W   : sensor resolution
     labels : optional bool array, True = real signal, False = injected noise.
              ``None`` when ground truth is unknown (e.g. real recordings).
+    kinds  : optional int array giving the *kind* of each event (see KIND_* in
+             :mod:`stcd.synth`): 0=signal, 1=BA, 2=hot-pixel (1a), 3=column/row
+             correlated readout (1b), 4=cluster. Lets the bake-off score 1a and 1b
+             separately. ``None`` when unknown. When present, ``labels`` should
+             equal ``kinds == 0``.
     """
 
     xs: np.ndarray
@@ -42,6 +47,7 @@ class Events:
     H: int
     W: int
     labels: Optional[np.ndarray] = None
+    kinds: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         self.xs = np.asarray(self.xs, dtype=np.int64)
@@ -54,11 +60,15 @@ class Events:
         self.ps = ps.astype(np.int64)
         if self.labels is not None:
             self.labels = np.asarray(self.labels, dtype=bool)
+        if self.kinds is not None:
+            self.kinds = np.asarray(self.kinds, dtype=np.int64)
         n = len(self.xs)
         if not (len(self.ys) == len(self.ts) == len(self.ps) == n):
             raise ValueError("Events arrays must all have the same length")
         if self.labels is not None and len(self.labels) != n:
             raise ValueError("labels length must match number of events")
+        if self.kinds is not None and len(self.kinds) != n:
+            raise ValueError("kinds length must match number of events")
 
     def __len__(self) -> int:
         return len(self.xs)
@@ -79,6 +89,7 @@ class Events:
             ts=self.ts[order],
             ps=self.ps[order],
             labels=None if self.labels is None else self.labels[order],
+            kinds=None if self.kinds is None else self.kinds[order],
         )
 
     def select(self, mask: np.ndarray) -> "Events":
@@ -91,6 +102,7 @@ class Events:
             ts=self.ts[mask],
             ps=self.ps[mask],
             labels=None if self.labels is None else self.labels[mask],
+            kinds=None if self.kinds is None else self.kinds[mask],
         )
 
     @staticmethod
@@ -100,6 +112,7 @@ class Events:
             raise ValueError("concat requires at least one non-empty stream")
         H, W = streams[0].H, streams[0].W
         have_labels = all(s.labels is not None for s in streams)
+        have_kinds = all(s.kinds is not None for s in streams)
         return Events(
             xs=np.concatenate([s.xs for s in streams]),
             ys=np.concatenate([s.ys for s in streams]),
@@ -109,6 +122,9 @@ class Events:
             W=W,
             labels=(
                 np.concatenate([s.labels for s in streams]) if have_labels else None
+            ),
+            kinds=(
+                np.concatenate([s.kinds for s in streams]) if have_kinds else None
             ),
         )
 

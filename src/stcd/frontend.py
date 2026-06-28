@@ -200,7 +200,12 @@ class LIFCoincidence(nn.Module):
     def theta(self) -> Tensor:
         return F.softplus(self.raw_theta)
 
-    def forward(self, x: Tensor, dt: float) -> tuple[Tensor, Tensor]:  # [P,H,W,T]
+    def forward(self, x: Tensor, dt: float,
+                bias: Tensor | None = None) -> tuple[Tensor, Tensor]:  # [P,H,W,T]
+        """``bias`` (optional, broadcastable to ``x``) is an external per-cell offset
+        added to the membrane *at the decision* (not to the integrated state): the
+        neuron fires iff ``v + bias ≥ θ``. Used by B3's gather/threshold-side toggle
+        to inject the per-pixel anti-Hebbian weight ``a``."""
         if self.seq_kernel > 0:
             x = self._apply_seq_kernel(x)
         a = torch.exp(-dt / self.tau)
@@ -213,12 +218,13 @@ class LIFCoincidence(nn.Module):
         adapt = torch.zeros_like(x[..., 0])
         for t in range(x.shape[-1]):
             v = a * v + x[..., t]
+            b = 0.0 if bias is None else bias[..., t]
             theta_eff = theta0 + g * adapt
             # adaptation-discounted support: repetitively-firing cells score low
-            score[..., t] = v - g * adapt
-            s = spike(v - theta_eff, self.beta)
+            score[..., t] = (v + b) - g * adapt
+            s = spike((v + b) - theta_eff, self.beta)
             spikes[..., t] = s
-            v = v - s * theta_eff            # reset by (adaptive) threshold
+            v = v - s * theta_eff            # reset by (adaptive) threshold (state only)
             adapt = beta_a * adapt + s        # spike-frequency adaptation
         return spikes, score
 
@@ -263,6 +269,22 @@ class FrontEndConfig:
     adapt_gain: float = 0.0   # spike-frequency adaptation strength (0 = plain LIF)
     tau_a: float = 20e-3      # adaptation leak time-constant (s)
     dt: float = 5e-3          # time-bin width used to build tensors
+    # --- B3: per-pixel anti-Hebbian contribution weight `a` (Idea-1 1a/1b) ----- #
+    # A per-pixel scalar that rises when neighbours out-fire a pixel and falls when
+    # the pixel out-fires its neighbourhood (da/dt = δ(r_neigh − r_self)); a chronic
+    # self-firer (hot pixel) sinks `a`. Three first-class toggles:
+    b3: bool = False              # enable B3
+    b3_side: str = "scatter"      # "scatter": firing pixel deposits `event + a` into
+                                  #   neighbours' support; "gather": add `a` at the
+                                  #   receiving decision (fire iff V + a ≥ θ)
+    b3_update: str = "raw"        # drive the `a` update from "raw" camera firings or
+                                  #   from "output" (forwarded/kept) spikes
+    b3_clamp_nonneg: bool = False # True: clamp a ≥ 0 (pure relative discount);
+                                  #   False: allow a < 0 (active inhibition of nbrs)
+    b3_delta: float = 0.5         # anti-Hebbian step size δ
+    b3_tau: float = 50e-3         # leak of `a` back toward 0 (s) — reuses the τ machinery
+    b3_a_min: float = -4.0        # clamp floor when a < 0 allowed
+    b3_a_max: float = 4.0         # clamp ceiling
 
 
 class SpikingFrontEnd(nn.Module):
@@ -289,9 +311,56 @@ class SpikingFrontEnd(nn.Module):
 
     def forward(self, tensor: Tensor, dt: float | None = None) -> tuple[Tensor, Tensor]:
         dt = self.cfg.dt if dt is None else dt
-        pooled = self.spatial(tensor)
-        spikes, membrane = self.lif(pooled, dt)
-        return spikes, membrane
+        if not self.cfg.b3:
+            pooled = self.spatial(tensor)
+            return self.lif(pooled, dt)
+        return self._forward_b3(tensor, dt)
+
+    # -- B3: per-pixel anti-Hebbian contribution weight ---------------------- #
+    def _b3_a_trajectory(self, firing: Tensor, dt: float) -> Tensor:
+        """Causal per-pixel weight ``a`` over time from a per-pixel/bin ``firing``
+        count tensor ``[H,W,T]``. Returns ``A`` ``[H,W,T]`` where ``A[...,t]`` is the
+        value of ``a`` *before* bin ``t`` is integrated (so it's causal)."""
+        H, W, T = firing.shape
+        k = self.cfg.neighbor_k
+        z = firing.permute(2, 0, 1).unsqueeze(1)            # [T,1,H,W]
+        w = torch.ones(1, 1, k, k, dtype=z.dtype, device=z.device)
+        box = F.conv2d(z, w, padding=k // 2).squeeze(1)     # [T,H,W] k×k box (incl centre)
+        self_f = firing.permute(2, 0, 1)                     # [T,H,W]
+        neigh_f = box - self_f                               # centre-excluded neighbour count
+        denom = max(k * k - 1, 1)
+        delta = self.cfg.b3_delta
+        beta = math.exp(-dt / self.cfg.b3_tau)
+        amin = 0.0 if self.cfg.b3_clamp_nonneg else self.cfg.b3_a_min
+        amax = self.cfg.b3_a_max
+        a = torch.zeros(H, W, dtype=firing.dtype, device=firing.device)
+        A = torch.empty(T, H, W, dtype=firing.dtype, device=firing.device)
+        for t in range(T):
+            A[t] = a                                         # causal (pre-update) value
+            a = beta * a + delta * (neigh_f[t] / denom - self_f[t])
+            a = a.clamp(amin, amax)
+        return A.permute(1, 2, 0).contiguous()              # [H,W,T]
+
+    def _forward_b3(self, tensor: Tensor, dt: float) -> tuple[Tensor, Tensor]:
+        if self.cfg.pool != 1:
+            raise ValueError("B3 requires pool=1 (per-pixel registers)")
+        # Firing signal driving the `a` update.
+        if self.cfg.b3_update == "output":
+            base_spikes, _ = self.lif(self.spatial(tensor), dt)
+            firing = base_spikes.sum(0)                      # [H,W,T] forwarded spikes
+        elif self.cfg.b3_update == "raw":
+            firing = tensor.sum(0)                           # [H,W,T] raw event counts
+        else:
+            raise ValueError(f"unknown b3_update {self.cfg.b3_update!r}")
+        A = self._b3_a_trajectory(firing, dt)               # [H,W,T]
+        if self.cfg.b3_side == "scatter":
+            fired = (tensor.sum(0) > 0).to(tensor.dtype)     # [H,W,T] any-polarity firing
+            x_mod = tensor + (A * fired).unsqueeze(0)        # deposit `event + a`
+            return self.lif(self.spatial(x_mod), dt)
+        elif self.cfg.b3_side == "gather":
+            return self.lif(self.spatial(tensor), dt, bias=A.unsqueeze(0))
+        else:
+            raise ValueError(f"unknown b3_side {self.cfg.b3_side!r}")
 
     # -- per-event interface ------------------------------------------------- #
     def _event_cells(self, ev: Events, grid: TimeGrid) -> tuple[Tensor, Tensor, Tensor, Tensor]:

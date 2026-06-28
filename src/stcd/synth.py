@@ -24,6 +24,14 @@ import numpy as np
 
 from .events import Events
 
+# Noise-kind codes carried on ``Events.kinds`` so the bake-off can score the two
+# Idea-1 noise processes separately (1a = hot pixels, 1b = correlated readout).
+KIND_SIGNAL = 0
+KIND_BA = 1       # uncorrelated background activity (Poisson)
+KIND_HOT = 2      # 1a — hot/leaky pixels (fixed location, high self-rate)
+KIND_COLUMN = 3   # 1b — column/row correlated readout noise
+KIND_CLUSTER = 4  # static flickering blobs (spatially correlated, no motion)
+
 
 @dataclass
 class SynthConfig:
@@ -33,7 +41,8 @@ class SynthConfig:
     fps: int = 2000                 # render frame rate (sets temporal resolution)
     contrast_threshold: float = 0.15  # log-intensity change needed to fire (C)
     noise_rate_hz: float = 1.0      # background activity, events / pixel / second
-    scene: Literal["bars", "hbars", "disks"] = "bars"
+    scene: Literal["bars", "hbars", "disks", "checker"] = "bars"
+    checker_cell: int = 4           # checkerboard square size (px) — fine texture/corners
     num_objects: int = 3
     bg_intensity: float = 0.5       # background grey level in (0, 1]
     fg_intensity: float = 1.0       # moving-object level
@@ -55,6 +64,19 @@ class SynthConfig:
     cluster_size: int = 3
     cluster_events: int = 40
     cluster_burst: float = 0.015   # each blob fires its events within this window (s)
+    # Column/row correlated-readout noise (1b): a shared amplifier/arbiter fires a
+    # group of pixels along one readout line *near-simultaneously*. Because the
+    # firing pixels are spatial neighbours along the line, this noise genuinely HAS
+    # neighbour support and passes coincidence filters (BAF/time-surface/STCD) — the
+    # 1b failure mode that per-pixel 1a methods miss. Targeted by the column detector
+    # and by B3's scatter-side contribution discount.
+    n_columns: int = 0
+    column_axis: Literal["col", "row"] = "col"
+    column_rate_hz: float = 50.0   # bursts per line per second
+    column_jitter: float = 2e-5    # coincidence window of a burst (s) — << τ
+    column_frac: float = 0.5       # fraction of the line's pixels that fire per burst
+    column_span_frac: float = 1.0  # fraction of the line length the noise spans
+    column_mode: Literal["fixed", "roaming"] = "fixed"  # persistent hot line vs roaming arbiter
 
 
 def _render_video(cfg: SynthConfig, rng: np.random.Generator) -> np.ndarray:
@@ -79,6 +101,19 @@ def _render_video(cfg: SynthConfig, rng: np.random.Generator) -> np.ndarray:
                 level=cfg.fg_intensity if rng.random() > 0.4 else cfg.bg_intensity * 0.4,
             )
         )
+
+    # Recall stress: a globally-translating checkerboard is dense in edges AND
+    # corners, where a pixel genuinely out-fires its neighbours — the exact real
+    # signal B3's anti-Hebbian discount risks suppressing. Measure SR here.
+    if cfg.scene == "checker":
+        o = objects[0]
+        cell = max(2, int(cfg.checker_cell))
+        for f, t in enumerate(ts):
+            sx = o["vx"] * t; sy = o["vy"] * t
+            cb = (((xx + sx) // cell).astype(np.int64)
+                  + ((yy + sy) // cell).astype(np.int64)) % 2
+            video[f] = np.where(cb == 0, cfg.bg_intensity, cfg.fg_intensity).astype(np.float32)
+        return video
 
     for f, t in enumerate(ts):
         for o in objects:
@@ -140,11 +175,13 @@ def _events_from_video(
 
     if not xs:
         return Events(np.array([]), np.array([]), np.array([]), np.array([]),
-                      H=H, W=W, labels=np.array([], dtype=bool))
+                      H=H, W=W, labels=np.array([], dtype=bool),
+                      kinds=np.array([], dtype=np.int64))
     xs = np.concatenate(xs); ys = np.concatenate(ys)
     ts = np.concatenate(ts); ps = np.concatenate(ps)
     return Events(xs, ys, ts, ps, H=H, W=W,
-                  labels=np.ones(len(xs), dtype=bool))
+                  labels=np.ones(len(xs), dtype=bool),
+                  kinds=np.full(len(xs), KIND_SIGNAL, dtype=np.int64))
 
 
 def inject_noise(
@@ -164,6 +201,7 @@ def inject_noise(
         ps=rng.integers(0, 2, size=n),
         H=H, W=W,
         labels=np.zeros(n, dtype=bool),
+        kinds=np.full(n, KIND_BA, dtype=np.int64),
     )
     return Events.concat(signal, noise).time_sorted()
 
@@ -193,9 +231,11 @@ def inject_hot_pixels(
         ps.append(rng.integers(0, 2, size=k))
     if not xs:
         return stream
+    n_hot_ev = sum(len(t) for t in ts)
     hot = Events(np.concatenate(xs), np.concatenate(ys), np.concatenate(ts),
                  np.concatenate(ps), H=H, W=W,
-                 labels=np.zeros(sum(len(t) for t in ts), dtype=bool))
+                 labels=np.zeros(n_hot_ev, dtype=bool),
+                 kinds=np.full(n_hot_ev, KIND_HOT, dtype=np.int64))
     return Events.concat(stream, hot).time_sorted()
 
 
@@ -224,10 +264,73 @@ def inject_cluster_noise(
         xs.append(np.clip(bx + ox, 0, W - 1)); ys.append(np.clip(by + oy, 0, H - 1))
         ts.append(rng.uniform(t_start, t_start + burst, size=k))   # dense burst
         ps.append(rng.integers(0, 2, size=k))
+    n_blob_ev = sum(len(t) for t in ts)
     blob = Events(np.concatenate(xs), np.concatenate(ys), np.concatenate(ts),
                   np.concatenate(ps), H=H, W=W,
-                  labels=np.zeros(sum(len(t) for t in ts), dtype=bool))
+                  labels=np.zeros(n_blob_ev, dtype=bool),
+                  kinds=np.full(n_blob_ev, KIND_CLUSTER, dtype=np.int64))
     return Events.concat(stream, blob).time_sorted()
+
+
+def inject_column_noise(
+    stream: Events, n_lines: int, duration: float, rng: np.random.Generator,
+    axis: str = "col", rate_hz: float = 50.0, jitter: float = 2e-5,
+    frac: float = 0.5, span_frac: float = 1.0, mode: str = "fixed",
+) -> Events:
+    """Add column/row correlated-readout noise (1b, ``label=False``, ``kind=COLUMN``).
+
+    A shared readout amplifier/arbiter fires a *contiguous run* of pixels along one
+    line (``axis='col'`` → a column at fixed x; ``'row'`` → a row at fixed y)
+    *near-simultaneously* (within ``jitter`` ≪ τ). The run is contiguous, so the
+    firing pixels are spatial neighbours and this noise genuinely HAS neighbour
+    support → it passes coincidence filters, the 1b failure mode per-pixel 1a
+    methods miss. ``rate_hz`` bursts/line/s; each burst lights a run of
+    ``frac·span_frac·line_len`` pixels.
+
+    ``mode``:
+    * ``"fixed"`` — a persistent hot line (column of stuck pixels). High per-pixel
+      rate, so ``rate_cap`` and B3 (persistent self-firer) CAN catch it.
+    * ``"roaming"`` — each burst hits a fresh random line + position (arbiter
+      contention). Per-pixel rate stays LOW so ``rate_cap`` and B3 miss it; only a
+      column-aggregate/anisotropy detector (Strategy 8/9) should catch it. This is
+      the genuinely hard 1b that distinguishes the strategies."""
+    H, W = stream.H, stream.W
+    if n_lines <= 0:
+        return stream
+    t0 = float(stream.ts.min()) if len(stream) else 0.0
+    n_idx = W if axis == "col" else H
+    line_len = H if axis == "col" else W
+    seg = max(2, int(round(span_frac * line_len)))
+    run = min(seg, max(2, int(round(frac * seg))))   # contiguous run length
+    xs, ys, ts, ps = [], [], [], []
+    for _ in range(n_lines):
+        idx0 = rng.integers(0, n_idx)
+        start0 = rng.integers(0, line_len - seg + 1) if seg < line_len else 0
+        n_bursts = int(rng.poisson(rate_hz * duration))
+        for _ in range(n_bursts):
+            if mode == "roaming":
+                idx = int(rng.integers(0, n_idx))
+                rstart = int(rng.integers(0, line_len - run + 1)) if run < line_len else 0
+            else:  # fixed line; contiguous run anchored within its segment
+                idx = int(idx0)
+                rstart = start0 + (int(rng.integers(0, seg - run + 1)) if seg > run else 0)
+            pix = np.arange(rstart, rstart + run)
+            tb = rng.uniform(t0, t0 + duration)
+            et = tb + rng.uniform(0.0, jitter, size=run)
+            if axis == "col":
+                xs.append(np.full(run, idx)); ys.append(pix)
+            else:
+                xs.append(pix); ys.append(np.full(run, idx))
+            ts.append(et)
+            ps.append(rng.integers(0, 2, size=run))
+    if not xs:
+        return stream
+    n_col_ev = sum(len(t) for t in ts)
+    line = Events(np.concatenate(xs), np.concatenate(ys), np.concatenate(ts),
+                  np.concatenate(ps), H=H, W=W,
+                  labels=np.zeros(n_col_ev, dtype=bool),
+                  kinds=np.full(n_col_ev, KIND_COLUMN, dtype=np.int64))
+    return Events.concat(stream, line).time_sorted()
 
 
 def generate(cfg: SynthConfig | None = None) -> Events:
@@ -239,9 +342,13 @@ def generate(cfg: SynthConfig | None = None) -> Events:
     stream = inject_noise(signal, cfg.noise_rate_hz, cfg.duration, rng)
     stream = inject_hot_pixels(stream, cfg.n_hot_pixels, cfg.hot_pixel_rate_hz,
                                cfg.duration, rng)
-    return inject_cluster_noise(stream, cfg.n_clusters, cfg.cluster_size,
-                                cfg.cluster_events, cfg.duration, rng,
-                                burst=cfg.cluster_burst)
+    stream = inject_cluster_noise(stream, cfg.n_clusters, cfg.cluster_size,
+                                  cfg.cluster_events, cfg.duration, rng,
+                                  burst=cfg.cluster_burst)
+    return inject_column_noise(stream, cfg.n_columns, cfg.duration, rng,
+                               axis=cfg.column_axis, rate_hz=cfg.column_rate_hz,
+                               jitter=cfg.column_jitter, frac=cfg.column_frac,
+                               span_frac=cfg.column_span_frac, mode=cfg.column_mode)
 
 
 def generate_with_video(cfg: SynthConfig | None = None) -> tuple[Events, np.ndarray]:

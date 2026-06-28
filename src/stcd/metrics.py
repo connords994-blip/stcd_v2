@@ -154,3 +154,30 @@ def sweep_threshold(scores: np.ndarray, labels: np.ndarray,
                     thresholds: np.ndarray) -> list[DenoiseMetrics]:
     """Evaluate the denoiser at each score threshold (keep iff score ≥ thr)."""
     return [evaluate_filter(labels, scores >= thr) for thr in thresholds]
+
+
+def kind_subset_metrics(
+    labels: np.ndarray, kept: np.ndarray, kinds: np.ndarray,
+    noise_kinds, scores: np.ndarray | None = None, signal_kind: int = 0,
+) -> dict:
+    """Evaluate a denoiser against ONE noise process in isolation.
+
+    Restricts the event set to *signal* events (``kinds == signal_kind``) plus the
+    events whose ``kinds`` is in ``noise_kinds``, then reports the usual
+    :func:`evaluate_filter` metrics (SR / NR / DA / F1 / SNR / retention) and, if a
+    per-event ``scores`` array is given, the ROC-AUC on that subset. This is what
+    lets the Idea-1 bake-off report 1a (hot pixels) and 1b (correlated readout)
+    separately — an aggregate metric hides which process a strategy actually beats
+    (e.g. the neighbour-support multiple #3 is expected to fail on 1b).
+    """
+    labels = np.asarray(labels, dtype=bool)
+    kept = np.asarray(kept, dtype=bool)
+    kinds = np.asarray(kinds, dtype=np.int64)
+    noise_kinds = [int(k) for k in np.atleast_1d(noise_kinds)]
+    sub = (kinds == signal_kind) | np.isin(kinds, noise_kinds)
+    out = evaluate_filter(labels[sub], kept[sub]).as_dict()
+    if scores is not None:
+        scores = np.asarray(scores, dtype=np.float64)
+        out["auc"] = float(roc(scores[sub], labels[sub])["auc"])
+    out["n_sub"] = int(sub.sum())
+    return out
