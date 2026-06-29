@@ -1,8 +1,9 @@
 """Train the B1 dynamic-threshold SNN on LED (from scratch) and eval on LED test.
 
 Patch-based training (random HxW crops) to fit 8GB VRAM at 1280x720; coarse train dt
-for tractable BPTT; full-frame eval. Env: HEAD(theta|scatter), STEPS, PS(patch),
-B(batch), DT(ms), N_POOL(train slices), N_EVAL(test slices), EVAL_EVERY, LR.
+for tractable BPTT; full-frame eval. Env: MODEL(b1|b2|combined|fb_snn|fb_ssn),
+HEAD(theta|scatter), STEPS, PS(patch), B(batch), DT(ms), N_POOL(train slices),
+N_EVAL(test slices), EVAL_EVERY, LR.
 """
 import os, sys, time
 import numpy as np
@@ -13,10 +14,10 @@ from stcd import metrics
 from stcd.datasets import led
 from stcd.events import events_to_tensor, TimeGrid
 from stcd.frontend import SpikingFrontEnd, FrontEndConfig
-from stcd.learned import DynThreshSNN, SpatialDenoiser, CombinedDenoiser
+from stcd.learned import DynThreshSNN, SpatialDenoiser, CombinedDenoiser, FeedbackDenoiser
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "data", "led")
-MODEL = os.environ.get("MODEL", "b1")   # b1=dyn-threshold SNN, b2=spatial recombiner, combined=B1+B2
+MODEL = os.environ.get("MODEL", "b1")   # b1=dyn-threshold SNN, b2=spatial recombiner, combined=B1+B2, fb_snn/fb_ssn=feedback
 HEAD = os.environ.get("HEAD", "theta")
 STEPS = int(os.environ.get("STEPS", "400"))
 PS = int(os.environ.get("PS", "160"))
@@ -29,7 +30,7 @@ LR = float(os.environ.get("LR", "1e-3"))
 T = max(1, round(0.01 / DT))           # bins per 10ms slice
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 rng = np.random.default_rng(0)
-print(f"device={dev} head={HEAD} steps={STEPS} PS={PS} B={B} dt={DT*1e3}ms T={T} pool={N_POOL}")
+print(f"device={dev} model={MODEL} head={HEAD} steps={STEPS} PS={PS} B={B} dt={DT*1e3}ms T={T} pool={N_POOL}")
 
 
 def load_pool(split, n):
@@ -100,9 +101,12 @@ def evaluate(model):
 
 
 _models = {"b2": lambda: SpatialDenoiser(), "combined": lambda: CombinedDenoiser(),
-           "b1": lambda: DynThreshSNN(C=16, head=HEAD)}
+           "b1": lambda: DynThreshSNN(C=16, head=HEAD),
+           "fb_snn": lambda: FeedbackDenoiser(backend="snn"),
+           "fb_ssn": lambda: FeedbackDenoiser(backend="ssn")}
 model = _models.get(MODEL, _models["b1"])().to(dev)
-tag = {"b2": "b2_spatial", "combined": "combined"}.get(MODEL, f"b1_{HEAD}")
+tag = {"b2": "b2_spatial", "combined": "combined",
+       "fb_snn": "fb_snn", "fb_ssn": "fb_ssn"}.get(MODEL, f"b1_{HEAD}")
 print(f"model={MODEL} ({tag})")
 opt = torch.optim.Adam(model.parameters(), lr=LR)
 print(f"init eval: AUC/DA = {evaluate(model)}")
