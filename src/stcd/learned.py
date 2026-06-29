@@ -331,3 +331,54 @@ class FeedbackDenoiser(nn.Module):
     @torch.no_grad()
     def score_cells(self, x: torch.Tensor, use_feedback: bool = True) -> torch.Tensor:
         return self.forward(x, use_feedback=use_feedback)[:, 0]
+
+
+class FeedbackOnBase(nn.Module):
+    """Streaming-causal feedback wrapped around a (typically frozen, pretrained) base
+    denoiser that emits per-(pixel,bin) logits ``[B,1,H,W,T]`` — e.g. B2 ``SpatialDenoiser``.
+
+    Tests whether output→threshold feedback **stacks on a learned spatial core** rather
+    than the bare box-sum: at each bin the base logit is thresholded to a forwarded spike,
+    which (via the SNN/SSN feedback) biases the *next* bin's logit. With ``use_feedback=
+    False`` the output is exactly the base model, so on−off is a clean attribution of what
+    the feedback adds on top of the spatial ceiling. ``thr`` is the spike threshold on the
+    base logit (0 = the base's own decision boundary). Same I/O contract."""
+
+    def __init__(self, base: nn.Module, backend: str = "ssn", thr: float = 0.0,
+                 beta: float = 10.0, Cf: int | None = None, d_state: int = 4,
+                 freeze_base: bool = True):
+        super().__init__()
+        self.base = base
+        if freeze_base:
+            for p in self.base.parameters():
+                p.requires_grad_(False)
+        self.thr = thr
+        self.beta = beta
+        if backend == "snn":
+            self.fb = _FeedbackSNN(Cf=Cf or 16)
+        elif backend == "ssn":
+            self.fb = _FeedbackSSN(Cf=Cf or 8, d_state=d_state)
+        else:
+            raise ValueError(backend)
+
+    def forward(self, x: torch.Tensor, use_feedback: bool = True) -> torch.Tensor:
+        if self.base.training != self.training:
+            self.base.eval()                       # base stays in eval (frozen) regardless
+        base_logits = self.base(x)                 # [B,1,H,W,T]
+        if not use_feedback:
+            return base_logits
+        B, _, H, W, T = base_logits.shape
+        bias = torch.zeros(B, 1, H, W, device=x.device, dtype=x.dtype)
+        state = None
+        out = []
+        for t in range(T):
+            lt = base_logits[..., t]               # [B,1,H,W]
+            score = lt + bias                      # feedback from spikes < t
+            s = spike(score - self.thr, self.beta)
+            out.append(score)
+            state, bias = self.fb.step(state, s)
+        return torch.stack(out, dim=-1)            # [B,1,H,W,T]
+
+    @torch.no_grad()
+    def score_cells(self, x: torch.Tensor, use_feedback: bool = True) -> torch.Tensor:
+        return self.forward(x, use_feedback=use_feedback)[:, 0]
