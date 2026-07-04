@@ -14,7 +14,7 @@ from stcd import metrics
 from stcd.datasets import led
 from stcd.events import events_to_tensor, TimeGrid
 from stcd.frontend import SpikingFrontEnd, FrontEndConfig
-from stcd.learned import DynThreshSNN, SpatialDenoiser, CombinedDenoiser, FeedbackDenoiser
+from stcd.learned import DynThreshSNN, SpatialDenoiser, CombinedDenoiser, FeedbackDenoiser, SpikingUNet
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "data", "led")
 MODEL = os.environ.get("MODEL", "b1")   # b1=dyn-threshold SNN, b2=spatial recombiner, combined=B1+B2, fb_snn/fb_ssn=feedback
@@ -103,10 +103,11 @@ def evaluate(model):
 _models = {"b2": lambda: SpatialDenoiser(), "combined": lambda: CombinedDenoiser(),
            "b1": lambda: DynThreshSNN(C=16, head=HEAD),
            "fb_snn": lambda: FeedbackDenoiser(backend="snn"),
-           "fb_ssn": lambda: FeedbackDenoiser(backend="ssn")}
+           "fb_ssn": lambda: FeedbackDenoiser(backend="ssn"),
+           "unet": lambda: SpikingUNet(C=16)}
 model = _models.get(MODEL, _models["b1"])().to(dev)
 tag = {"b2": "b2_spatial", "combined": "combined",
-       "fb_snn": "fb_snn", "fb_ssn": "fb_ssn"}.get(MODEL, f"b1_{HEAD}")
+       "fb_snn": "fb_snn", "fb_ssn": "fb_ssn", "unet": "unet"}.get(MODEL, f"b1_{HEAD}")
 print(f"model={MODEL} ({tag})")
 opt = torch.optim.Adam(model.parameters(), lr=LR)
 print(f"init eval: AUC/DA = {evaluate(model)}")

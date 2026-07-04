@@ -333,6 +333,63 @@ class FeedbackDenoiser(nn.Module):
         return self.forward(x, use_feedback=use_feedback)[:, 0]
 
 
+class SpikingUNet(nn.Module):
+    """Spiking U-Net oracle (cost ignored) — a multi-scale spiking-conv encoder-decoder
+    that emits a per-(pixel,bin) signal/noise logit ``[B,1,H,W,T]`` (same contract as
+    B1/B2). Two encoder downsamples + a bottleneck + two skip-concat decoder upsamples;
+    every conv is a LIF (membrane leak α, surrogate spike, subtractive reset) whose state
+    is carried across the T bins. This is the architecture the LED-paper SOTA (DTSNN /
+    EDSNN) uses, rebuilt from scratch on our rich ``[2,H,W,T]`` input + our objective, so
+    the comparison to B2 is apples-to-apples (removes DTSNN's binarized-1-frame handicap).
+
+    ``forward(x, state=...)`` returns ``(out, state)`` when ``return_state=True`` so the
+    membranes can be CARRIED ACROSS 10 ms slices (temporal extent) — off by default to
+    match B1/B2's per-slice reset. Inputs are zero-padded to a multiple of 4 (for the two
+    2× pools) and the output is cropped back, so any H×W works."""
+
+    def __init__(self, C: int = 16, tau_steps: float = 2.0, beta: float = 5.0):
+        super().__init__()
+        self.beta = beta
+        self.alpha = float(torch.exp(torch.tensor(-1.0 / tau_steps)))
+        self.enc1 = nn.Conv2d(2, C, 3, padding=1)
+        self.enc2 = nn.Conv2d(C, 2 * C, 3, padding=1)
+        self.bott = nn.Conv2d(2 * C, 4 * C, 3, padding=1)
+        self.dec2 = nn.Conv2d(4 * C + 2 * C, 2 * C, 3, padding=1)   # skip-concat enc2
+        self.dec1 = nn.Conv2d(2 * C + C, C, 3, padding=1)           # skip-concat enc1
+        self.head = nn.Conv2d(C, 1, 3, padding=1)
+
+    def forward(self, x: torch.Tensor, state=None, return_state: bool = False):
+        B, P, H, W, T = x.shape
+        Hp, Wp = ((H + 3) // 4) * 4, ((W + 3) // 4) * 4
+        if (Hp, Wp) != (H, W):
+            x = F.pad(x, (0, 0, 0, Wp - W, 0, Hp - H))     # pad W then H (T untouched)
+        a, beta = self.alpha, self.beta
+        v1 = v2 = vb = u2 = u1 = vo = 0.0
+        if state is not None:
+            v1, v2, vb, u2, u1, vo = state
+        out = []
+        for t in range(T):
+            v1 = a * v1 + self.enc1(x[..., t]); s1 = spike(v1 - 1.0, beta); v1 = v1 - s1
+            v2 = a * v2 + self.enc2(F.avg_pool2d(s1, 2)); s2 = spike(v2 - 1.0, beta); v2 = v2 - s2
+            vb = a * vb + self.bott(F.avg_pool2d(s2, 2)); sb = spike(vb - 1.0, beta); vb = vb - sb
+            ub = F.interpolate(sb, scale_factor=2, mode="nearest")
+            u2 = a * u2 + self.dec2(torch.cat([ub, s2], 1)); su2 = spike(u2 - 1.0, beta); u2 = u2 - su2
+            uu = F.interpolate(su2, scale_factor=2, mode="nearest")
+            u1 = a * u1 + self.dec1(torch.cat([uu, s1], 1)); su1 = spike(u1 - 1.0, beta); u1 = u1 - su1
+            vo = a * vo + self.head(su1)                    # readout membrane (no reset)
+            out.append(vo)
+        y = torch.stack(out, dim=-1)                        # [B,1,Hp,Wp,T]
+        if (Hp, Wp) != (H, W):
+            y = y[:, :, :H, :W, :]
+        if return_state:
+            return y, (v1, v2, vb, u2, u1, vo)
+        return y
+
+    @torch.no_grad()
+    def score_cells(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)[:, 0]
+
+
 class FeedbackOnBase(nn.Module):
     """Streaming-causal feedback wrapped around a (typically frozen, pretrained) base
     denoiser that emits per-(pixel,bin) logits ``[B,1,H,W,T]`` — e.g. B2 ``SpatialDenoiser``.
